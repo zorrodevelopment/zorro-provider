@@ -59,10 +59,10 @@ public final class ZorroProvider extends Provider {
         // Собственные алгоритмы — обязательные.
         "com.example.zorro.jcajce.provider.digest.ZorroSha512$Mappings",
         "com.example.zorro.jcajce.provider.mac.ZorroHmacSha512$Mappings",
-        // Обёртки над Kalkan — опциональные.
-        "?com.example.zorro.jcajce.provider.digest.ZorroHash512$Mappings",
-        "?com.example.zorro.jcajce.provider.signature.ZorroSign512$Mappings",
-        "?com.example.zorro.jcajce.provider.keystore.ZorroPkcs12$Mappings",
+        // Streebog-512, ECGOST-2012-512 и PKCS#12 — собственные реализации.
+        "com.example.zorro.jcajce.provider.digest.ZorroHash512$Mappings",
+        "com.example.zorro.jcajce.provider.signature.ZorroSign512$Mappings",
+        "com.example.zorro.jcajce.provider.keystore.ZorroPkcs12$Mappings",
     };
 
     private static final long serialVersionUID = 1L;

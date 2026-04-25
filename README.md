@@ -1,35 +1,65 @@
-# ZORRO — пример собственного JCE-провайдера
+# ZORRO — самостоятельный JCE-провайдер
 
-Демонстрационный криптопровайдер `ZORRO` поверх Kalkan. Регистрируется в JVM
-наряду с любыми другими провайдерами (Sun, BouncyCastle, Kalkan), даёт
-собственные имена алгоритмов и собственные OID-ы, но реальную крипто-работу
-делегирует Kalkan.
+`ZORRO` — учебный/демонстрационный JCE-провайдер. Регистрируется в JVM
+наряду с любыми другими провайдерами (SunJCE, BouncyCastle, Kalkan), даёт
+собственные имена алгоритмов и собственные OID-ы. Вся криптография реализована
+**внутри ZORRO**, без делегирования в сторонние библиотеки.
 
 ```
 java.security.Security
    ├── SunJCE
-   ├── BouncyCastle    (org.bouncycastle.jce.provider.BouncyCastleProvider)
-   ├── KALKAN          (kz.gov.pki.kalkan.jce.provider.KalkanProvider)
-   └── ZORRO           (com.example.zorro.provider.ZorroProvider)
-                            ↓ делегирует
-                          KALKAN
+   ├── BouncyCastle    (опционально, нужно только для тестов)
+   ├── KALKAN          (опционально, нужно только для тестов)
+   └── ZORRO           ← самостоятелен, sign/verify, hash и PKCS#12 — свои
+```
+
+## Главная фишка: казахстанский PKCS#12
+
+ZORRO умеет читать PFX-файлы НУЦ РК с алгоритмом ECGOST3410-2015 и казахстанскими OID-ами
+(`1.2.398.3.10.1.1.2.2`, `1.2.398.3.10.1.1.2.2.1` и т.д.) — то есть PFX, которые
+**ни BouncyCastle, ни openssl самостоятельно загрузить не могут**.
+
+```bash
+$ openssl pkcs12 -in test.p12 -info -legacy
+... unsupported private key algorithm: TYPE=1.2.398.3.10.1.1.2.2
+```
+
+```java
+KeyStore ks = KeyStore.getInstance("ZORRO-PKCS12", "ZORRO");
+ks.load(new FileInputStream("test.p12"), "Qwerty12".toCharArray());
+PrivateKey pk = (PrivateKey) ks.getKey(alias, password);   // OK!
 ```
 
 ## Зачем такая обёртка нужна
 
-В реальности провайдер-обёртка нужна, чтобы:
+1. **Свой brand и OID-пространство** — компания строит PKI, у неё свои OID для
+   расширений сертификатов и политик подписи.
+2. **Развязка бизнес-кода от конкретной библиотеки** — клиентский код пишет
+   `Signature.getInstance("ZORRO-SIGN-512")`, а внутри ZORRO может стоять или
+   собственная реализация, или обёртка, или PKCS#11-делегат — без правок в
+   приложении.
+3. **Аудит и контроль** — провайдер может логировать вызовы, проверять политику
+   использования ключей, добавлять hardware-token слой.
+4. **Учить и тестировать** — понять архитектуру JCE-провайдеров проще всего
+   через свой собственный.
 
-1. **Иметь свой brand и OID-пространство.** Если ваша компания строит
-   PKI или подписной сервис, у неё должны быть собственные OID для
-   расширений сертификатов, политик подписи и т.д.
-2. **Развязать бизнес-код от конкретной библиотеки.** Завтра вместо Kalkan
-   можно взять BouncyCastle с GOST-аддоном, а имена алгоритмов
-   `ZORRO-SIGN-512` останутся теми же.
-3. **Аудит и контроль.** Провайдер-обёртка может логировать вызовы,
-   проверять политику использования ключей, добавлять hardware-token
-   слой, и т.д.
-4. **Учить и тестировать.** Понять архитектуру JCE-провайдеров проще
-   всего, написав свой.
+## Зарегистрированные алгоритмы
+
+| Имя                | Тип            | Реализация                                                          |
+|--------------------|----------------|---------------------------------------------------------------------|
+| `ZORRO-SHA-512`    | MessageDigest  | собственная (FIPS 180-4)                                            |
+| `ZORRO-HMACSHA512` | Mac            | собственная (RFC 2104) ¹                                            |
+| `ZORRO-HASH-512`   | MessageDigest  | собственный Streebog-512 (ГОСТ Р 34.11-2012)                        |
+| `ZORRO-SIGN-512`   | Signature      | собственный ECGOST3410-2012-512 + Streebog-512                      |
+| `ZORRO-PKCS12`     | KeyStore       | собственный читатель PFX, поддерживает RU и KZ ECGOST OID-ы         |
+
+¹ Регистрация Mac-алгоритма в JCE формально требует подписанный Oracle JAR
+(JCE Code Signing CA). В демо для проверки HMAC используется прямой вызов
+`com.example.zorro.crypto.HmacSha512` минуя `Mac.getInstance(...)`. Подпись JAR
+ничего не меняет в самой криптографии.
+
+OID-пространство — `1.3.6.1.4.1.99999.*` (примерное; в production регистрируется
+свой PEN в IANA).
 
 ## Структура
 
@@ -39,138 +69,138 @@ zorro-provider/
 ├── src/main/java/com/example/zorro/
 │   ├── provider/
 │   │   ├── ZorroProvider.java      главный класс, регистрируется в JVM
-│   │   └── AlgorithmModule.java    интерфейс плагина
+│   │   └── AlgorithmModule.java    интерфейс модуля
+│   ├── crypto/                     "голая" криптография без JCE-обвязки
+│   │   ├── Sha512.java             FIPS 180-4
+│   │   ├── HmacSha512.java         RFC 2104
+│   │   ├── Streebog512.java        ГОСТ Р 34.11-2012, 512 бит
+│   │   ├── ec/
+│   │   │   ├── EcCurveParams.java  параметры кривой
+│   │   │   ├── EcPoint.java        арифметика точек EC
+│   │   │   ├── GostCurves.java     paramSetA/B/C из RFC 7836
+│   │   │   ├── EcGost2012Signer.java sign/verify
+│   │   │   └── EcCurveLookup.java  маппинг JDK ECParameterSpec → EcCurveParams
+│   │   └── asn1/
+│   │       ├── DerInput.java       минимальный DER+BER парсер
+│   │       ├── DerValue.java       TLV-структура
+│   │       └── DerOutput.java      DER-кодировщик
 │   ├── jcajce/provider/
-│   │   ├── digest/
-│   │   │   └── ZorroHash512.java   MessageDigestSpi → KALKAN
-│   │   ├── signature/
-│   │   │   └── ZorroSign512.java   SignatureSpi → KALKAN
-│   │   └── keystore/
-│   │       └── ZorroPkcs12.java    KeyStoreSpi → KALKAN
+│   │   ├── digest/                 SPI для MessageDigest
+│   │   ├── mac/                    SPI для Mac
+│   │   ├── signature/              SPI для Signature
+│   │   ├── keystore/               SPI для KeyStore + PKCS#12 PBE
+│   │   └── keys/                   ECPrivateKey/ECPublicKey + кодирование PKCS#8/SPKI
 │   ├── asn1/
 │   │   └── ZorroObjectIdentifiers.java   OID-ы провайдера
-│   ├── util/
-│   │   └── ByteUtils.java          BE/LE-утилиты
-│   └── demo/
-│       └── ZorroDemo.java          демонстрация
-└── README.md
+│   └── util/
+│       └── ByteUtils.java          BE/LE-утилиты
+└── src/test/                       37 тестов, см. ниже
 ```
-
-## Зарегистрированные алгоритмы
-
-| Имя                  | Тип            | Реализация                           | Зависимости |
-|----------------------|----------------|--------------------------------------|-------------|
-| `ZORRO-SHA-512`      | MessageDigest  | **собственная** (FIPS 180-4)         | нет         |
-| `ZORRO-HMACSHA512`   | Mac            | **собственная** (RFC 2104)           | нет         |
-| `ZORRO-HASH-512`     | MessageDigest  | обёртка над `GOST3411-2015-512`      | KALKAN      |
-| `ZORRO-SIGN-512`     | Signature      | обёртка над `ECGOST3410-2015-512`    | KALKAN      |
-| `ZORRO-PKCS12`       | KeyStore       | обёртка над `PKCS12`                 | KALKAN      |
-
-**Опциональность:** если KALKAN не зарегистрирован в JVM, провайдер
-ZORRO стартует без обёрток — будет доступен только `ZORRO-SHA-512`.
-Это достигается префиксом `?` в массиве `MODULES` главного класса
-провайдера и проверкой `Security.getProvider(BACKEND)` в `Mappings.register()`.
-
-И все — с собственными OID-ами в дереве `1.3.6.1.4.1.99999.*` (в production
-получите свой PEN).
 
 ## Сборка и запуск
 
-Нужны: JDK 11+, Maven, JAR Kalkan.
+Нужны: JDK 17+, Maven. BouncyCastle и Kalkan подтягиваются автоматически из
+Maven Central (BC только для тестов; Kalkan уже есть в локальном `~/.m2`).
 
 ```cmd
-set JAVA_HOME=D:\_PROGRAMS\jdk-17.0.12
-set PATH=%JAVA_HOME%\bin;%PATH%
+:: Сборка и unit-тесты
+mvn clean test
 
-:: 1) Установить Kalkan в локальный Maven-репо
-mkdir lib
-copy путь\к\kalkan-0_7_5.jar lib\
-mvn install:install-file ^
-    -Dfile=lib\kalkan-0_7_5.jar ^
-    -DgroupId=kz.gov.pki.kalkan ^
-    -DartifactId=knca_provider_jce_kalkan ^
-    -Dversion=0.7.5 ^
-    -Dpackaging=jar
-
-:: 2) Положить тестовый ключ
-copy путь\к\GOST512_xxx.p12 test.p12
-
-:: 3) Сборка и запуск
+:: Сборка артефакта + копирование зависимостей в target/lib
 mvn clean package
-java -cp "target\zorro-provider-1.0.0.jar;target\lib\*" ^
-     com.example.zorro.demo.ZorroTest
 ```
 
-## Ожидаемый вывод
+Все тесты проходят без какого-либо `test.p12` — единственный E2E-тест
+({@code ZorroPkcs12IntegrationTest}, {@code KalkanCrossTest}, {@code ZorroTest})
+требует файл `src/test/files/test.p12` с паролем `Qwerty12`. В репозитории лежит
+тестовый сертификат от НУЦ РК (KZ ГОСТ-2015).
 
+## Использование как библиотека
+
+```java
+import com.example.zorro.provider.ZorroProvider;
+import java.security.Security;
+import java.security.KeyStore;
+import java.security.Signature;
+
+// 1. Регистрируем провайдер.
+Security.addProvider(new ZorroProvider());
+
+// 2. Загружаем PFX (например, казахстанский).
+KeyStore ks = KeyStore.getInstance("ZORRO-PKCS12", "ZORRO");
+ks.load(new FileInputStream("user.p12"), password);
+String alias = ks.aliases().nextElement();
+PrivateKey priv = (PrivateKey) ks.getKey(alias, password);
+
+// 3. Публичный ключ.
+//    cert.getPublicKey() вернёт generic X509Key (JDK не знает KZ OID),
+//    поэтому парсим SubjectPublicKeyInfo напрямую:
+byte[] spki = ks.getCertificate(alias).getPublicKey().getEncoded();
+PublicKey pub = com.example.zorro.jcajce.provider.keys.GostKeyEncoding
+        .parseSubjectPublicKeyInfo(spki);
+
+// 4. Подписать.
+Signature signer = Signature.getInstance("ZORRO-SIGN-512", "ZORRO");
+signer.initSign(priv);
+signer.update(message);
+byte[] sig = signer.sign();   // 128 байт, формат r_LE || s_LE
+
+// 5. Проверить.
+Signature verifier = Signature.getInstance("ZORRO-SIGN-512", "ZORRO");
+verifier.initVerify(pub);
+verifier.update(message);
+boolean ok = verifier.verify(sig);
 ```
-=== ПРОВАЙДЕРЫ ===========================================================
-    SUN v...
-    SunRsaSign v...
-    SunJSSE v...
-    SunJCE v...
-    ...
-  ★ KALKAN v0.7.5
-  ★ ZORRO v1.0.0
 
-=== АЛГОРИТМЫ ПРОВАЙДЕРА ZORRO ===========================================
-  KeyStore.ZORRO-PKCS12
-  Mac.ZORRO-HMACSHA512
-  MessageDigest.ZORRO-HASH-512
-  MessageDigest.ZORRO-SHA-512
-  Signature.ZORRO-SIGN-512
+## Совместимость с другими провайдерами
 
-=== СОБСТВЕННЫЙ ALG: ZORRO-SHA-512 =======================================
-  алгоритм:    ZORRO-SHA-512
-  digest hex:  abcd... (тот же что у SunJCE SHA-512)
-  совпадает с SunJCE SHA-512: true
+ZORRO криптографически совместим и с Kalkan, и с BouncyCastle (математика одна
+и та же — ГОСТ Р 34.10-2012 paramSetA). Различаются только сериализационные
+форматы:
 
-=== СОБСТВЕННЫЙ ALG: ZORRO-HMACSHA512 ====================================
-  алгоритм:    ZORRO-HMACSHA512
-  mac hex:     def0...
-  совпадает с SunJCE HmacSHA512: true
+| Провайдер | Имя алгоритма          | Формат подписи          |
+|-----------|------------------------|-------------------------|
+| ZORRO     | `ZORRO-SIGN-512`       | `r_LE(64) ‖ s_LE(64)`   |
+| Kalkan    | `ECGOST3410-2015-512`  | `r_LE(64) ‖ s_LE(64)`   |
+| BC        | `ECGOST3410-2012-512`  | `s_BE(64) ‖ r_BE(64)`   |
 
-=== ЗАГРУЗКА P12 ЧЕРЕЗ ZORRO-PKCS12 ======================================
-  alias:        ...
-  key class:    kz.gov.pki.kalkan.jce.provider.asymmetric.ecgost15.EcGost3410_2015PrivateKey
-  ...
+ZORRO выбрал Kalkan-формат как «родной» (казахстанская конвенция).
+**ZORRO ↔ Kalkan** обмениваются подписями без преобразований.
+**ZORRO ↔ BC** — нужен побайтный реверс всей подписи:
+```java
+byte[] sigForBc = reverseBytes(zorroSig);
+byte[] sigFromBc = reverseBytes(bcSig);   // прежде чем передать в ZORRO
+```
 
-=== ХЭШ ЧЕРЕЗ ZORRO-HASH-512 =============================================
-  алгоритм:    ZORRO-HASH-512
-  провайдер:   ZORRO
-  digest hex:  abcd...
-  совпадает с KALKAN GOST3411-2015-512: true
+См. `KalkanCrossTest` для всех шести направлений (sign×verify) между тремя
+провайдерами.
 
-=== ПОДПИСЬ ЧЕРЕЗ ZORRO-SIGN-512 =========================================
-  signature size: 128 bytes
-  ...
+## Тесты
 
-=== ПРОВЕРКА ПОДПИСИ ЧЕРЕЗ ZORRO =========================================
-  валидна (ZORRO):  true
+37 тестов, все зелёные:
 
-=== КРОСС-ПРОВЕРКА: ZORRO-подпись через KALKAN ===========================
-  валидна (KALKAN): true   (доказывает, что мы не «переизобрели» формат)
-  KALKAN-подпись валидна через ZORRO: true
+| Группа                       | Что проверяет                                                  |
+|------------------------------|----------------------------------------------------------------|
+| `Streebog512Test` (9)        | KAT-векторы + кросс-проверка с BC                              |
+| `EcGost2012SignerTest` (8)   | sign/verify roundtrip, кросс-проверка с BC                     |
+| `ZorroHash512SpiTest` (3)    | Streebog через JCE-фасад, доступ по OID                        |
+| `ZorroSign512SpiTest` (6)    | подпись через JCE-фасад, ZORRO↔BC через стандартный JDK API    |
+| `ZorroPkcs12IntegrationTest` (4) | загрузка реального p12 НУЦ РК, инвариант `d·G == Q`        |
+| `KalkanCrossTest` (6)        | все 6 пар sign×verify между ZORRO, BC, KALKAN на ключе из p12  |
+| `ZorroTest` (1)              | E2E-демо с печатью прогресса                                   |
 
-=== НЕГАТИВНЫЙ ТЕСТ ======================================================
-  изменённое сообщение: false   (должно быть false)
-
-=== ОБРАЩЕНИЕ ПО OID =====================================================
-  OID '1.3.6.1.4.1.99999.1.2.1' разрешился в: ZORRO-SIGN-512
-
-=== ИТОГ =================================================================
-  ВСЁ ОК — провайдер ZORRO работает корректно,
-  совместим с KALKAN на уровне формата.
+```cmd
+mvn test                   # все
+mvn test -Dtest=ZorroTest  # E2E-демо
 ```
 
 ## Как добавить ещё один алгоритм
 
 1. Создайте класс, наследующий `MessageDigestSpi`, `SignatureSpi`,
-   `KeyStoreSpi`, `KeyPairGeneratorSpi`, `CipherSpi` и т.д.
+   `KeyStoreSpi`, `KeyPairGeneratorSpi` и т.д.
 2. Внутри сделайте вложенный класс `Mappings implements AlgorithmModule`,
    который кладёт mapping'и в provider.
-3. Допишите имя класса `Mappings` в массив `MODULES`
-   в `ZorroProvider.java`.
+3. Допишите имя класса `Mappings` в массив `MODULES` в `ZorroProvider.java`.
 
 Например, для добавления хэша 256 бит:
 
@@ -190,6 +220,8 @@ public class ZorroHash256 extends MessageDigestSpi {
 И в `ZorroProvider.MODULES`:
 ```java
 private static final String[] MODULES = {
+    "com.example.zorro.jcajce.provider.digest.ZorroSha512$Mappings",
+    "com.example.zorro.jcajce.provider.mac.ZorroHmacSha512$Mappings",
     "com.example.zorro.jcajce.provider.digest.ZorroHash512$Mappings",
     "com.example.zorro.jcajce.provider.digest.ZorroHash256$Mappings",   // ← добавили
     "com.example.zorro.jcajce.provider.signature.ZorroSign512$Mappings",
@@ -197,11 +229,22 @@ private static final String[] MODULES = {
 };
 ```
 
-## Что осталось «настоящей» подписью провайдера
+## Что нужно для production
 
-Для production-провайдера, который будет работать с *Cipher*-алгоритмами
-типа AES, нужна подпись JAR файла специальным сертификатом от Oracle
-(JCE Code Signing CA). Без этой подписи Cipher-engine откажется работать.
-Для `MessageDigest`, `Signature`, `KeyStore`, `KeyPairGenerator` — **подпись
-не требуется**. Этот пример включает только последние, поэтому работает
-без специальной подписи.
+1. **JCE Code Signing.** Mac, Cipher, KeyAgreement, KeyGenerator,
+   SecretKeyFactory требуют, чтобы JAR провайдера был подписан Oracle JCE
+   Code Signing CA. Этот пример обходится без подписи: `Mac.ZORRO-HMACSHA512`
+   зарегистрирован в провайдере, но при `Mac.getInstance(... , "ZORRO")`
+   JCE откажется его выдавать. Для прохождения этого шага нужен
+   соответствующий сертификат и процедура запроса у Oracle.
+2. **Свой PEN.** Замените корень OID-ов в `ZorroObjectIdentifiers.ROOT`
+   на собственный, выданный IANA (https://pen.iana.org/).
+3. **Производительность.** EC-арифметика реализована через `BigInteger`
+   и double-and-add — это удобно читать, но медленно. Для нагруженных
+   систем стоит перейти на проективные координаты или wNAF.
+4. **Constant-time.** Текущий signer не constant-time (scalar mul зависит
+   от битов `k`); для side-channel-резистентности нужна Montgomery ladder
+   или constant-time wNAF.
+5. **Запись PKCS#12.** Сейчас `ZorroPkcs12` поддерживает только чтение PFX.
+   Для подписи запросов на сертификат и генерации ключей нужно реализовать
+   `engineStore` и шифрование bag'ов.

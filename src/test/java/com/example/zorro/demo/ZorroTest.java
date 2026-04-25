@@ -1,13 +1,17 @@
 package com.example.zorro.demo;
 
 import com.example.zorro.asn1.ZorroObjectIdentifiers;
+import com.example.zorro.crypto.HmacSha512;
+import com.example.zorro.jcajce.provider.keys.GostKeyEncoding;
+import com.example.zorro.jcajce.provider.keys.ZorroGostPrivateKey;
+import com.example.zorro.jcajce.provider.keys.ZorroGostPublicKey;
 import com.example.zorro.provider.ZorroProvider;
 import com.example.zorro.util.ByteUtils;
 import kz.gov.pki.kalkan.jce.provider.KalkanProvider;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 import java.io.FileInputStream;
+import java.security.KeyFactory;
 import java.security.KeyStore;
 import java.security.MessageDigest;
 import java.security.PrivateKey;
@@ -15,35 +19,55 @@ import java.security.Provider;
 import java.security.PublicKey;
 import java.security.Security;
 import java.security.Signature;
-import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
+import java.security.spec.PKCS8EncodedKeySpec;
+import java.security.spec.X509EncodedKeySpec;
 import java.util.Enumeration;
 
 /**
- * Демонстрация работы провайдера ZORRO с тем же тестовым P12,
- * что и в {@code KalkanDemo}, но через собственные имена алгоритмов:
- * <pre>
- *   KeyStore.getInstance("ZORRO-PKCS12", "ZORRO")
- *   MessageDigest.getInstance("ZORRO-HASH-512", "ZORRO")
- *   Signature.getInstance("ZORRO-SIGN-512", "ZORRO")
- * </pre>
+ * Демонстрационный E2E-тест: загружаем казахстанский PFX, печатаем
+ * подробный лог по всем алгоритмам провайдера ZORRO и устраиваем
+ * кросс-проверку с KALKAN.
  *
- * <h2>Дополнительно проверяет</h2>
- * Подпись, сделанная через ZORRO, валидна также при проверке через KALKAN
- * (и наоборот) — потому что внутри это один и тот же алгоритм.
- * Это доказывает, что ZORRO не «переизобретает», а корректно
- * перекладывает работу на backend.
+ * <h2>Что проверяет</h2>
+ * <ul>
+ *   <li>Собственный SHA-512 даёт те же байты, что SunJCE.</li>
+ *   <li>Собственный HMAC-SHA-512 совпадает с SunJCE HmacSHA512.</li>
+ *   <li>ZORRO-PKCS12 читает реальный PFX от НУЦ РК (которого ни BC,
+ *       ни openssl сами не разбирают).</li>
+ *   <li>ZORRO-HASH-512 (Streebog-512) даёт тот же результат, что
+ *       Kalkan {@code GOST3411-2015-512}.</li>
+ *   <li>Подпись через ZORRO-SIGN-512 валидна как через ZORRO, так
+ *       и через Kalkan (после конвертации формата).</li>
+ *   <li>Подпись через Kalkan валидна через ZORRO.</li>
+ *   <li>Изменённое сообщение отвергается.</li>
+ *   <li>Поиск алгоритма по OID работает.</li>
+ * </ul>
+ *
+ * <h2>Особенности</h2>
+ * <ul>
+ *   <li>{@code Mac.getInstance(... , "ZORRO")} тут не используется: JCE
+ *       требует, чтобы JAR-провайдеров с Mac/Cipher был подписан Oracle.
+ *       Корректность нашего HMAC-SHA-512 проверяется через прямой вызов
+ *       {@link HmacSha512} и сравнение с SunJCE.</li>
+ *   <li>Публичный ключ из сертификата извлекается через парсер SPKI
+ *       ({@link GostKeyEncoding}), потому что JDK не знает казахстанские
+ *       OID-ы и {@code cert.getPublicKey()} возвращает generic
+ *       {@code X509Key}.</li>
+ *   <li>ZORRO использует тот же формат подписи, что и Kalkan
+ *       ({@code r_LE || s_LE}), поэтому подписи переходят между ними без
+ *       преобразований. Реверс понадобился бы только при обмене с BC.</li>
+ * </ul>
  */
 class ZorroTest {
 
-    @Disabled
     @Test
     void complexTest() throws Exception {
         String p12Path  = "src/test/files/test.p12";
         char[] password = "Qwerty12".toCharArray();
         byte[] message  = "Hello from ZORRO provider".getBytes();
 
-        // --- 1. Регистрируем оба провайдера: KALKAN (backend) и ZORRO
+        // --- 1. Регистрируем оба провайдера: KALKAN (для кросс-проверки) и ZORRO
         if (Security.getProvider(KalkanProvider.PROVIDER_NAME) == null) {
             Security.addProvider(new KalkanProvider());
         }
@@ -63,8 +87,9 @@ class ZorroTest {
                 .map(e -> e.getKey().toString())
                 .filter(k -> k.startsWith("MessageDigest.")
                         || k.startsWith("Signature.")
-                        || k.startsWith("KeyStore."))
-                .filter(k -> !k.contains(" "))   // без атрибутов вроде "SupportedKeyClasses"
+                        || k.startsWith("KeyStore.")
+                        || k.startsWith("Mac."))
+                .filter(k -> !k.contains(" "))
                 .sorted()
                 .forEach(k -> System.out.println("  " + k));
 
@@ -75,7 +100,6 @@ class ZorroTest {
         byte[] shaHash = sha.digest();
         System.out.println("  алгоритм:    " + sha.getAlgorithm());
         System.out.println("  digest hex:  " + ByteUtils.toHex(shaHash));
-        // Сверяем с эталоном из SunJCE
         MessageDigest shaRef = MessageDigest.getInstance("SHA-512");
         shaRef.update(message);
         byte[] refHash = shaRef.digest();
@@ -83,21 +107,22 @@ class ZorroTest {
         System.out.println("  совпадает с SunJCE SHA-512: " + shaMatches
                 + "   (доказывает, что наша реализация корректна)");
 
-        // --- 1.6. Собственный HMAC-SHA-512
-        line("СОБСТВЕННЫЙ ALG: ZORRO-HMACSHA512");
+        // --- 1.6. Собственный HMAC-SHA-512 — через прямой вызов класса.
+        // Через Mac.getInstance JCE отказывается работать, потому что
+        // требует, чтобы JAR-провайдер с Mac был подписан Oracle. Корректность
+        // алгоритма проверяется тут сравнением с SunJCE HmacSHA512.
+        line("СОБСТВЕННЫЙ ALG: HMAC-SHA-512 (прямой вызов класса)");
         byte[] macKey = "secret-key-for-demo".getBytes();
-        javax.crypto.Mac zorroMac = javax.crypto.Mac.getInstance("ZORRO-HMACSHA512", "ZORRO");
-        zorroMac.init(new javax.crypto.spec.SecretKeySpec(macKey, "ZORRO-HMACSHA512"));
-        zorroMac.update(message);
-        byte[] zorroMacBytes = zorroMac.doFinal();
-        System.out.println("  алгоритм:    " + zorroMac.getAlgorithm());
-        System.out.println("  mac hex:     " + ByteUtils.toHex(zorroMacBytes));
-        // Сверяем с эталоном HmacSHA512 из SunJCE
+        HmacSha512 ourMac = new HmacSha512();
+        ourMac.init(macKey);
+        ourMac.update(message, 0, message.length);
+        byte[] ourMacBytes = ourMac.doFinal();
+        System.out.println("  mac hex:     " + ByteUtils.toHex(ourMacBytes));
         javax.crypto.Mac refMac = javax.crypto.Mac.getInstance("HmacSHA512");
         refMac.init(new javax.crypto.spec.SecretKeySpec(macKey, "HmacSHA512"));
         refMac.update(message);
         byte[] refMacBytes = refMac.doFinal();
-        boolean macMatches = ByteUtils.constantTimeEquals(zorroMacBytes, refMacBytes);
+        boolean macMatches = ByteUtils.constantTimeEquals(ourMacBytes, refMacBytes);
         System.out.println("  совпадает с SunJCE HmacSHA512: " + macMatches
                 + "  (доказывает корректность HMAC по RFC 2104)");
 
@@ -112,16 +137,22 @@ class ZorroTest {
             String a = e.nextElement();
             if (ks.isKeyEntry(a)) { alias = a; break; }
         }
-        PrivateKey privateKey = (PrivateKey) ks.getKey(alias, password);
-        Certificate cert = ks.getCertificate(alias);
-        if (!(cert instanceof X509Certificate)) {
-            throw new IllegalStateException("Ожидался X.509 сертификат");
-        }
-        X509Certificate x509 = (X509Certificate) cert;
-        PublicKey publicKey = x509.getPublicKey();
+        ZorroGostPrivateKey privateKey = (ZorroGostPrivateKey) ks.getKey(alias, password);
+        X509Certificate x509 = (X509Certificate) ks.getCertificate(alias);
+
+        // Публичный ключ — парсим SPKI напрямую: cert.getPublicKey() даст
+        // generic X509Key, потому что JDK не знает казахстанский OID.
+        ZorroGostPublicKey publicKey = GostKeyEncoding.parseSubjectPublicKeyInfo(
+                x509.getPublicKey().getEncoded());
+
         System.out.println("  alias:        " + alias);
         System.out.println("  key class:    " + privateKey.getClass().getName());
         System.out.println("  cert subject: " + x509.getSubjectX500Principal());
+
+        // Перевыпускаем ключ как Kalkan-native, чтобы делать им кросс-операции.
+        KeyFactory kalkanKf = KeyFactory.getInstance("ECGOST3410-2015-512", "KALKAN");
+        PrivateKey kalkanPriv = kalkanKf.generatePrivate(new PKCS8EncodedKeySpec(privateKey.getEncoded()));
+        PublicKey  kalkanPub  = kalkanKf.generatePublic(new X509EncodedKeySpec(publicKey.getEncoded()));
 
         // --- 3. Хэш через ZORRO-HASH-512
         line("ХЭШ ЧЕРЕЗ ZORRO-HASH-512");
@@ -158,19 +189,21 @@ class ZorroTest {
         boolean validZorro = verifier.verify(signature);
         System.out.println("  валидна (ZORRO):  " + validZorro);
 
-        // --- 6. Кросс-проверка: подпись ZORRO проверяется через KALKAN
+        // --- 6. Кросс-проверка: подпись ZORRO проверяется через KALKAN.
+        // ZORRO выдаёт подпись в Kalkan-формате (r_LE || s_LE), поэтому
+        // обмен идёт без конвертации.
         line("КРОСС-ПРОВЕРКА: ZORRO-подпись через KALKAN");
         Signature kalkanVerifier = Signature.getInstance("ECGOST3410-2015-512", "KALKAN");
-        kalkanVerifier.initVerify(publicKey);
+        kalkanVerifier.initVerify(kalkanPub);
         kalkanVerifier.update(message);
         boolean validKalkan = kalkanVerifier.verify(signature);
         System.out.println("  валидна (KALKAN): " + validKalkan
-                + "   (доказывает, что мы не «переизобрели» формат)");
+                + "   (тот же формат подписи, что у Kalkan — без реверса)");
 
         // --- 7. Обратная кросс-проверка: подпись KALKAN проверяется через ZORRO
         line("КРОСС-ПРОВЕРКА: KALKAN-подпись через ZORRO");
         Signature kalkanSigner = Signature.getInstance("ECGOST3410-2015-512", "KALKAN");
-        kalkanSigner.initSign(privateKey);
+        kalkanSigner.initSign(kalkanPriv);
         kalkanSigner.update(message);
         byte[] sigByKalkan = kalkanSigner.sign();
         System.out.println("  алгоритм подписи:  " + kalkanSigner.getAlgorithm());
@@ -181,9 +214,9 @@ class ZorroTest {
         Signature zorroVerifier = Signature.getInstance("ZORRO-SIGN-512", "ZORRO");
         zorroVerifier.initVerify(publicKey);
         zorroVerifier.update(message);
-        boolean validReverse = zorroVerifier.verify(sigByKalkan);
-        System.out.println("  валидна (ZORRO):   " + validReverse
-                + "   (подпись KALKAN успешно проверяется ZORRO)");
+        boolean validKalkanSig = zorroVerifier.verify(sigByKalkan);
+        System.out.println("  валидна (ZORRO):   " + validKalkanSig
+                + "   (подпись KALKAN успешно проверяется ZORRO без преобразований)");
 
         // --- 8. Негативный тест
         line("НЕГАТИВНЫЙ ТЕСТ");
@@ -206,15 +239,16 @@ class ZorroTest {
         // --- ИТОГ
         line("ИТОГ");
         boolean allOk = shaMatches && macMatches && hashMatches && validZorro
-                && validKalkan && validReverse && !validTampered;
+                && validKalkan && validKalkanSig && !validTampered;
         if (allOk) {
             System.out.println("  ВСЁ ОК — провайдер ZORRO работает корректно:");
             System.out.println("   - собственный SHA-512 даёт правильные хэши;");
             System.out.println("   - собственный HMAC-SHA-512 даёт правильные MAC;");
-            System.out.println("   - обёртки над KALKAN совместимы по формату.");
+            System.out.println("   - собственный Streebog-512 совпадает с эталоном Kalkan;");
+            System.out.println("   - собственный ECGOST sign/verify совместим с Kalkan по криптографии.");
         } else {
             System.out.println("  ОШИБКА — проверьте вывод выше");
-            System.exit(1);
+            org.junit.jupiter.api.Assertions.fail("E2E test did not pass all checks");
         }
     }
 

@@ -30,6 +30,16 @@
             <optional>true</optional>
         </dependency>
 
+        <!-- BouncyCastle используется только тестами для перекрёстной проверки
+             нашей собственной криптографии (Streebog, ECGOST). Не входит в
+             runtime-артефакт. -->
+        <dependency>
+            <groupId>org.bouncycastle</groupId>
+            <artifactId>bcprov-jdk18on</artifactId>
+            <version>1.78.1</version>
+            <scope>test</scope>
+        </dependency>
+
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter-api</artifactId>
