@@ -13,21 +13,22 @@
     <name>ZORRO Cryptographic Provider</name>
     <description>
         Самостоятельный JCE-провайдер: содержит собственную реализацию SHA-512
-        и опциональные обёртки над Kalkan для ECGOST-2015 и Streebog.
+        и HMAC-SHA-512, а также Streebog-512, ECGOST3410-2012-512 и PKCS#12,
+        реализованные через low-level примитивы BouncyCastle.
     </description>
 
     <properties>
         <maven.compiler.source>17</maven.compiler.source>
         <maven.compiler.target>17</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <bouncycastle.version>1.78.1</bouncycastle.version>
     </properties>
 
     <dependencies>
         <dependency>
-            <groupId>kz.gov.pki.kalkan</groupId>
-            <artifactId>knca_provider_jce_kalkan</artifactId>
-            <version>0.7.5</version>
-            <optional>true</optional>
+            <groupId>org.bouncycastle</groupId>
+            <artifactId>bcprov-jdk18on</artifactId>
+            <version>${bouncycastle.version}</version>
         </dependency>
 
         <dependency>

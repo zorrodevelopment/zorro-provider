@@ -3,22 +3,18 @@ package com.example.zorro.provider;
 import java.security.Provider;
 
 /**
- * ZORRO Cryptographic Provider — пример собственного JCE-провайдера,
- * расширяющего возможности Kalkan/BouncyCastle собственными именами
- * алгоритмов и собственными OID-ами.
+ * ZORRO Cryptographic Provider — самостоятельный JCE-провайдер с
+ * собственными именами алгоритмов и собственными OID-ами.
  *
  * <h2>Архитектура</h2>
  * <ul>
- *   <li>Провайдер использует Kalkan как backend — все «настоящие»
- *       криптографические операции (хэш Streebog, подпись ECGOST-2015)
- *       делегируются туда.</li>
- *   <li>Поверх этого добавлены собственные имена и OID'ы:
- *       <ul>
- *         <li>{@code MessageDigest.ZORRO-HASH-512}</li>
- *         <li>{@code Signature.ZORRO-SIGN-512}</li>
- *         <li>{@code KeyStore.ZORRO-PKCS12}</li>
- *       </ul>
- *   </li>
+ *   <li>{@code MessageDigest.ZORRO-SHA-512} и {@code Mac.ZORRO-HMACSHA512} —
+ *       полностью собственная реализация, не зависит от внешних библиотек.</li>
+ *   <li>{@code MessageDigest.ZORRO-HASH-512}, {@code Signature.ZORRO-SIGN-512},
+ *       {@code KeyStore.ZORRO-PKCS12} — реализованы внутри ZORRO через
+ *       low-level примитивы BouncyCastle (GOST3411-2012, ECGOST3410-2012,
+ *       PKCS12KeyStoreSpi). Это не делегат в провайдер «BC» — наш SPI
+ *       сам исполняет работу, BC выступает как библиотека примитивов.</li>
  *   <li>Алгоритмы регистрируются через {@link AlgorithmModule} —
  *       каждый модуль кладёт свои mappings.</li>
  * </ul>
@@ -30,9 +26,8 @@ import java.security.Provider;
  * </pre>
  *
  * <h2>Зависимости</h2>
- * Требует, чтобы в JVM был зарегистрирован провайдер KALKAN
- * (наш backend для ECGOST/Streebog). Если KALKAN не найден,
- * операции упадут с {@code NoSuchProviderException}.
+ * Compile/runtime: {@code org.bouncycastle:bcprov-jdk18on}. Регистрировать
+ * BC-провайдер в JVM не нужно — мы используем BC как библиотеку.
  */
 public final class ZorroProvider extends Provider {
 
@@ -45,24 +40,23 @@ public final class ZorroProvider extends Provider {
     /** Описание — попадёт в Provider.getInfo(). */
     private static final String INFO =
             "ZORRO Cryptographic Provider v" + VERSION_STR
-            + " — backend: KALKAN";
+            + " (own SHA-512/HMAC, BouncyCastle-backed Streebog/ECGOST/PKCS12)";
 
     /**
-     * Список модулей, регистрирующих алгоритмы.
-     *
-     * <p>Модули с префиксом {@code "?"} регистрируются опционально:
-     * если их зависимости (например, KALKAN) не на classpath или
-     * не зарегистрированы, провайдер ZORRO стартует без них и
-     * соответствующие алгоритмы будут просто отсутствовать.
+     * Список модулей, регистрирующих алгоритмы. Все модули обязательные:
+     * BouncyCastle — hard dependency, и без него провайдер не имеет
+     * смысла собираться.
      */
     private static final String[] MODULES = {
-        // Собственные алгоритмы — обязательные.
         "com.example.zorro.jcajce.provider.digest.ZorroSha512$Mappings",
         "com.example.zorro.jcajce.provider.mac.ZorroHmacSha512$Mappings",
-        // Обёртки над Kalkan — опциональные.
-        "?com.example.zorro.jcajce.provider.digest.ZorroHash512$Mappings",
-        "?com.example.zorro.jcajce.provider.signature.ZorroSign512$Mappings",
-        "?com.example.zorro.jcajce.provider.keystore.ZorroPkcs12$Mappings",
+        "com.example.zorro.jcajce.provider.digest.ZorroHash512$Mappings",
+        "com.example.zorro.jcajce.provider.signature.ZorroSign512$Mappings",
+        // KeyFactory-транслятор должен быть зарегистрирован ДО KeyStore,
+        // чтобы PKCS12 (через DefaultJcaJceHelper) смог найти его при
+        // парсинге ключей с казахскими OID-ами.
+        "com.example.zorro.jcajce.provider.asymmetric.ZorroKalkanGostKeyFactory$Mappings",
+        "com.example.zorro.jcajce.provider.keystore.ZorroPkcs12$Mappings",
     };
 
     private static final long serialVersionUID = 1L;
@@ -76,21 +70,11 @@ public final class ZorroProvider extends Provider {
     /** Регистрирует все модули. Вызывается из конструктора. */
     private void setup() {
         for (String moduleClassName : MODULES) {
-            boolean optional = moduleClassName.startsWith("?");
-            String name = optional ? moduleClassName.substring(1) : moduleClassName;
-            try {
-                registerModule(name);
-            } catch (RuntimeException e) {
-                if (!optional) throw e;
-                // Опциональный модуль не загрузился — продолжаем тихо.
-                // Можно добавить логирование, если ZORRO будет в production.
-            }
+            registerModule(moduleClassName);
         }
     }
 
-    /** Загружает модуль по имени класса и вызывает {@link AlgorithmModule#register}.
-     *  Опциональные модули заворачиваются в каждый класс отдельно через try/catch
-     *  на ClassNotFoundException также внутри его конструктора. */
+    /** Загружает модуль по имени класса и вызывает {@link AlgorithmModule#register}. */
     private void registerModule(String className) {
         try {
             ClassLoader cl = ZorroProvider.class.getClassLoader();
